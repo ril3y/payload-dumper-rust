@@ -25,15 +25,6 @@ pub async fn run() -> Result<()> {
 
     let is_stdout = args.out.to_string_lossy() == "-";
     let ui = UiOutput::new(args.quiet, is_stdout);
-
-    let thread_count = if args.no_parallel {
-        1
-    } else {
-        args.threads.unwrap_or_else(|| num_cpus::get())
-    };
-
-    ui.println(format!("- Initialized {} thread(s)", thread_count));
-
     let start_time = Instant::now();
     let main_pb = ui.create_spinner("Starting...");
 
@@ -49,7 +40,7 @@ pub async fn run() -> Result<()> {
     }
 
     // Create output directory
-    if !is_stdout {
+    if !is_stdout && !(args.metadata.is_some() && args.out.extension().is_some()) {
         fs::create_dir_all(&args.out).await?;
     }
 
@@ -95,6 +86,7 @@ pub async fn run() -> Result<()> {
             mode,
             &args.images,
             is_stdout,
+            payload_info.source_info.clone(),
         )
         .await
         {
@@ -122,6 +114,7 @@ pub async fn run() -> Result<()> {
                 mode,
                 &args.images,
                 is_stdout,
+                payload_info.source_info.clone(),
             )
             .await
             {
@@ -148,6 +141,15 @@ pub async fn run() -> Result<()> {
         return Ok(());
     }
 
+    let thread_count = if args.no_parallel {
+        1
+    } else {
+        args.threads
+            .unwrap_or_else(num_cpus::get)
+            .min(partitions_to_extract.len())
+    };
+
+    ui.println(format!("- Initialized {} thread(s)", thread_count));
     ui.println(format!(
         "- Found {} partitions to extract",
         partitions_to_extract.len()
@@ -193,6 +195,7 @@ pub async fn run() -> Result<()> {
                 block_size as u64,
                 url,
                 payload_offset,
+                thread_count,
                 &ui,
             )
             .await?
@@ -220,6 +223,7 @@ pub async fn run() -> Result<()> {
             data_offset,
             block_size as u64,
             payload_info.reader,
+            thread_count,
             &ui,
         )
         .await?

@@ -7,6 +7,7 @@ use crate::constants::DEFAULT_USER_AGENT;
 use anyhow::{Result, anyhow};
 use futures_util::StreamExt;
 use reqwest::{Client, header};
+use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -15,19 +16,15 @@ use std::time::Duration;
 use std::sync::{Arc, OnceLock};
 
 #[cfg(feature = "hickory_dns")]
-static GLOBAL_DNS_RESOLVER: OnceLock<
-    Arc<hickory_resolver::Resolver<hickory_resolver::name_server::TokioConnectionProvider>>,
-> = OnceLock::new();
+static GLOBAL_DNS_RESOLVER: OnceLock<Arc<hickory_resolver::TokioResolver>> = OnceLock::new();
 
 #[cfg(feature = "hickory_dns")]
 async fn get_or_init_dns_resolver(
     custom_dns: Option<&str>,
-) -> Result<Arc<hickory_resolver::Resolver<hickory_resolver::name_server::TokioConnectionProvider>>>
-{
-    use hickory_proto::xfer::Protocol;
+) -> Result<Arc<hickory_resolver::TokioResolver>> {
     use hickory_resolver::Resolver;
-    use hickory_resolver::config::*;
-    use hickory_resolver::name_server::TokioConnectionProvider;
+    use hickory_resolver::config::{CLOUDFLARE, NameServerConfig, ResolverConfig};
+    use hickory_resolver::net::runtime::TokioRuntimeProvider;
 
     /*   if let Some(resolver) = GLOBAL_DNS_RESOLVER.get() {
            return Ok(resolver.clone());
@@ -53,26 +50,18 @@ async fn get_or_init_dns_resolver(
         }
 
         // Create config with custom DNS servers
-        let mut config = ResolverConfig::new();
+        let mut config = ResolverConfig::from_parts(None, vec![], vec![]);
         for ip in dns_ips {
-            let socket_addr = std::net::SocketAddr::new(ip, 53);
-            config.add_name_server(NameServerConfig {
-                socket_addr,
-                protocol: Protocol::Udp,
-                tls_dns_name: None,
-                http_endpoint: None,
-                trust_negative_responses: true,
-                bind_addr: None,
-            });
+            config.add_name_server(NameServerConfig::udp_and_tcp(ip));
         }
         config
     } else {
         // use Cloudflare DNS by default
-        ResolverConfig::cloudflare()
+        ResolverConfig::udp_and_tcp(&CLOUDFLARE)
     };
 
     let resolver =
-        Resolver::builder_with_config(config, TokioConnectionProvider::default()).build();
+        Resolver::builder_with_config(config, TokioRuntimeProvider::default()).build()?;
 
     let resolver = Arc::new(resolver);
 
@@ -86,6 +75,11 @@ async fn create_http_client(
     cookies: Option<&str>,
     dns: Option<&str>,
 ) -> Result<Client> {
+    static INIT_CRYPTO: Once = Once::new();
+    INIT_CRYPTO.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+
     let mut headers = header::HeaderMap::new();
 
     let ua = user_agent.unwrap_or(DEFAULT_USER_AGENT);
@@ -119,12 +113,12 @@ async fn create_http_client(
     // use custom DNS resolver when feature is enabled
     #[cfg(feature = "hickory_dns")]
     {
-        use hickory_resolver::name_server::TokioConnectionProvider;
+        use hickory_resolver::TokioResolver;
         use reqwest::dns::{Name, Resolve, Resolving};
         use std::net::SocketAddr;
 
         struct CustomDnsResolver {
-            resolver: Arc<hickory_resolver::Resolver<TokioConnectionProvider>>,
+            resolver: Arc<TokioResolver>,
         }
 
         impl Resolve for CustomDnsResolver {
@@ -137,8 +131,13 @@ async fn create_http_client(
                         .await
                         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
-                    let addrs: Box<dyn Iterator<Item = SocketAddr> + Send> =
-                        Box::new(lookup.into_iter().map(|ip| SocketAddr::new(ip, 0)));
+                    let addrs: Box<dyn Iterator<Item = SocketAddr> + Send> = Box::new(
+                        lookup
+                            .iter()
+                            .map(|ip| SocketAddr::new(ip, 0))
+                            .collect::<Vec<_>>()
+                            .into_iter(),
+                    );
 
                     Ok(addrs)
                 })
@@ -195,16 +194,6 @@ impl HttpReader {
                         .and_then(|v| v.to_str().ok())
                         .map(|v| v == "bytes")
                         .unwrap_or(false);
-                    /*
-                                        if !supports_ranges {
-                                            ACCEPT_RANGES_WARNING_SHOWN.get_or_init(|| {
-                                                eprintln!("- Warning: Server doesn't advertise Accept-Ranges: bytes");
-                                                eprintln!(
-                                                    "- Extraction may fail if server doesn't support range requests"
-                                                );
-                                            });
-                                        }
-                    */
                     // get content length
                     let content_length = response
                         .headers()

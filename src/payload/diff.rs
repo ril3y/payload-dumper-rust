@@ -270,18 +270,19 @@ pub async fn process_diff_operation(params: DiffOperationParams<'_>) -> Result<(
                 .context("Failed to write patched data")?;
         }
 
-        install_operation::Type::Lz4diffBsdiff => {
+        op_type @ (install_operation::Type::Lz4diffBsdiff
+        | install_operation::Type::Lz4diffPuffdiff) => {
             let source_data = ctx
                 .read_source_extents(source_file, &op.src_extents)
                 .await
-                .context("Failed to read source extents for LZ4DIFF_BSDIFF")?;
+                .context("Failed to read source extents for LZ4DIFF operation")?;
 
             let patch_offset = data_offset + op.data_offset.unwrap_or(0);
             let patch_length = op.data_length.unwrap_or(0);
 
             if patch_length > MAX_OPERATION_SIZE as u64 {
                 return Err(anyhow!(
-                    "Compressed patch size {} exceeds safety limit",
+                    "LZ4DIFF patch size {} exceeds safety limit",
                     patch_length
                 ));
             }
@@ -289,33 +290,17 @@ pub async fn process_diff_operation(params: DiffOperationParams<'_>) -> Result<(
             let mut patch_stream = payload_reader
                 .read_range(patch_offset, patch_length)
                 .await
-                .context("Failed to read LZ4 compressed patch data")?;
+                .context("Failed to read LZ4DIFF patch data")?;
 
-            let mut compressed_data = Vec::with_capacity(patch_length as usize);
+            let mut patch_data = Vec::with_capacity(patch_length as usize);
             patch_stream
-                .read_to_end(&mut compressed_data)
+                .read_to_end(&mut patch_data)
                 .await
-                .context("Failed to read compressed stream")?;
+                .context("Failed to read LZ4DIFF patch stream")?;
 
-            let patch_data = match lz4_flex::decompress_size_prepended(&compressed_data) {
-                Ok(data) => data,
-                Err(_) => lz4_flex::block::decompress(&compressed_data, MAX_OPERATION_SIZE)
-                    .map_err(|e| anyhow!("Failed to decompress LZ4 patch: {}", e))?,
-            };
+            let patched_data = lz4diff::lz4_patch(&source_data, &patch_data)
+                .map_err(|e| anyhow!("{:?} patch failed: {}", op_type, e))?;
 
-            if patch_data.len() > MAX_OPERATION_SIZE {
-                return Err(anyhow!(
-                    "Decompressed patch size {} exceeds safety limit",
-                    patch_data.len()
-                ));
-            }
-
-            // Apply BSDF2 patch
-            let mut patched_data = Vec::new();
-            bsdiff_android::patch_bsdf2(&source_data, &patch_data, &mut patched_data)
-                .map_err(|e| anyhow!("LZ4-BSDF2 patch failed: {}", e))?;
-
-            // Validate output size
             let expected_size: u64 = op
                 .dst_extents
                 .iter()
@@ -330,19 +315,55 @@ pub async fn process_diff_operation(params: DiffOperationParams<'_>) -> Result<(
                 ));
             }
 
-            // Write to destination
             ctx.write_dst_extents(out_file, &op.dst_extents, &patched_data)
                 .await
-                .context("Failed to write LZ4-patched data")?;
+                .context("Failed to write LZ4DIFF-patched data")?;
         }
 
-        install_operation::Type::Puffdiff | install_operation::Type::Lz4diffPuffdiff => {
-            reporter.on_warning(
-                partition_name,
-                operation_index,
-                "PUFFDIFF operations not supported yet".to_string(),
-            );
-            return Err(anyhow!("PUFFDIFF operation not supported"));
+        install_operation::Type::Puffdiff => {
+            let source_data = ctx
+                .read_source_extents(source_file, &op.src_extents)
+                .await
+                .context("Failed to read source extents for PUFFDIFF")?;
+
+            let patch_offset = data_offset + op.data_offset.unwrap_or(0);
+            let patch_length = op.data_length.unwrap_or(0);
+
+            if patch_length > MAX_OPERATION_SIZE as u64 {
+                return Err(anyhow!("Patch size {} exceeds safety limit", patch_length));
+            }
+
+            let mut patch_stream = payload_reader
+                .read_range(patch_offset, patch_length)
+                .await
+                .context("Failed to read patch data")?;
+
+            let mut patch_data = Vec::with_capacity(patch_length as usize);
+            patch_stream
+                .read_to_end(&mut patch_data)
+                .await
+                .context("Failed to read patch stream")?;
+
+            let patched_data = puffdiff::puffpatch(&source_data, &patch_data)
+                .map_err(|e| anyhow!("PUFFDIFF patch failed: {}", e))?;
+
+            let expected_size: u64 = op
+                .dst_extents
+                .iter()
+                .map(|e| e.num_blocks.unwrap_or(0) * ctx.block_size)
+                .sum();
+
+            if patched_data.len() != expected_size as usize {
+                return Err(anyhow!(
+                    "Patched data size mismatch: expected {} bytes, got {} bytes",
+                    expected_size,
+                    patched_data.len()
+                ));
+            }
+
+            ctx.write_dst_extents(out_file, &op.dst_extents, &patched_data)
+                .await
+                .context("Failed to write PUFFDIFF data")?;
         }
 
         install_operation::Type::Zucchini => {
